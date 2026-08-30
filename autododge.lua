@@ -43,8 +43,25 @@ local CFG = {
     FOLLOW_UPDATE_INTERVAL = 0.06,      -- ~16 Hz follower update; avoids per-frame physics churn
     FOLLOW_GAIN_XZ = 4.0,
     FOLLOW_GAIN_Y = 5.0,
-    FOLLOW_MAX_FORCE = 180000,
-    FOLLOW_MAX_SPEED = 90,
+    -- The fresh client dump does not expose a server anti-cheat threshold, but it
+    -- consistently treats Humanoid.WalkSpeed as the live movement-speed state.
+    -- Never request faster replicated movement than that live server-owned value.
+    FOLLOW_MAX_FORCE = 30000,
+    FORCED_WALK_SPEED = 35,
+    SERVER_SPEED_FALLBACK = 35,
+    SERVER_TRACK_SPEED_MULT = 1.00,
+    SERVER_DODGE_SPEED_MULT = 1.00,
+    SERVER_SPEED_MIN = 4.0,
+    SERVER_SPEED_MAX = 48.0,
+    SERVER_CORRECTION_DISTANCE = 3.0,
+    SERVER_CORRECTION_BACKOFF = 0.82,
+    SERVER_CORRECTION_MIN_SCALE = 0.62,
+    SERVER_CORRECTION_RECOVER_DELAY = 3.0,
+    SERVER_CORRECTION_RECOVER_RATE = 0.025,
+    -- Dodge uses the same replicated follower, but only the gain changes. The final
+    -- velocity cap is always derived from the current Humanoid.WalkSpeed below.
+    DODGE_FOLLOW_GAIN_XZ = 10.0,
+    DODGE_FOLLOW_GAIN_Y = 7.0,
     TARGET_SCAN_INTERVAL = 0.25,
     TARGET_MAX_DISTANCE = 2000,
     DEEP_NPC_RESCAN_INTERVAL = 2.0,     -- recovery scan only when there are zero LIVE candidates
@@ -171,7 +188,11 @@ local CFG = {
     -- gives payload[2] = the LOCKED landing CFrame immediately. The client then waits
     -- 0.40s, spawns artilleryRock 100 studs above that XZ, and tweens it down for 0.50s.
     -- Reserve the landing circle from the event itself instead of waiting for the rock visual.
-    VOLCANIC_ARTILLERY_IMPACT_RADIUS = 22.0,
+    -- The decompiled impact visual grows to Size 15 after landing. Treat that as a
+    -- ~7.5-stud visible radius plus a small local pad; the normal SAFETY_MARGIN is
+    -- added separately by the solver. This keeps the ~0.9s warning escapable at the
+    -- player's legitimate WalkSpeed instead of reserving an artificial 22-stud radius.
+    VOLCANIC_ARTILLERY_IMPACT_RADIUS = 9.25,
     VOLCANIC_ARTILLERY_EVENT_HOLD = 1.45,       -- covers 0.40 + 0.50 travel + impact/removal grace
     VOLCANIC_ARTILLERY_POST_REMOVE = 0.65,
     VOLCANIC_ARTILLERY_MAX_LIFE = 2.20,
@@ -431,6 +452,12 @@ local S = {
     hoverVelocity = nil,
     hoverGoal = nil,
     lastFollowUpdate = 0,
+    serverWalkSpeed = 0,
+    serverMoveCap = 0,
+    serverMoveScale = 1.0,
+    serverLastGoalDistance = nil,
+    serverLastCorrectionAt = -math.huge,
+    serverCorrectionCount = 0,
 
     -- Temple Core walking mode
     walkModeActive = false,
@@ -1822,23 +1849,14 @@ local function floorTeleportTo(pos, action, forceNow)
         return true
     end
 
-    local yaw = getYaw(S.root.CFrame)
-    if S.targetRoot and S.targetRoot.Parent then
-        local look = flat(S.targetRoot.Position - grounded)
-        if flatMagnitude(look) > 0.01 then
-            yaw = math.atan2(-look.X, -look.Z)
-        end
-    end
-
-    S.root.CFrame = CFrame.new(grounded) * CFrame.Angles(0, yaw, 0)
-    S.root.AssemblyLinearVelocity = Vector3.zero
-    S.root.AssemblyAngularVelocity = Vector3.zero
+    -- Legacy floor mode is disabled in this build, but keep its compatibility path
+    -- non-teleporting as well. If it is ever re-enabled, use ordinary Humanoid motion
+    -- rather than snapping HumanoidRootPart.CFrame.
     if S.hum and S.hum.Parent then
-        S.hum:Move(Vector3.zero, false)
+        S.hum:MoveTo(grounded)
     end
 
     S.lastFloorTeleportAt = now
-    S.teleports += 1
     if action then
         S.lastAction = action .. (fullySafe and "" or " / FAILSAFE")
     end
@@ -1973,8 +1991,58 @@ local function chooseDodgeOffset(basePos)
         end
     end
 
-    -- Preserve the original close rings, but append larger rings only when a real
-    -- circular blocker is too large to escape with the old 66-stud ceiling.
+    -- Server-speed mode: before considering boss-centered rings, search compact
+    -- offsets around the CURRENT character position. With no teleport, the nearest
+    -- safe edge is what matters; asking for a point 40+ studs away only wastes the
+    -- attack's warning time even though velocity itself is capped.
+    local timeBudget = math.huge
+    local nowForReach = clock()
+    for _, th in pairs(S.threats) do
+        if isInsideThreat(currentPos, th, CFG.SAFETY_MARGIN) and th.impactAt then
+            timeBudget = math.min(timeBudget, math.max(0, th.impactAt - nowForReach))
+        end
+    end
+    local ws = (S.hum and tonumber(S.hum.WalkSpeed)) or CFG.SERVER_SPEED_FALLBACK
+    ws = clamp(ws, CFG.SERVER_SPEED_MIN, CFG.SERVER_SPEED_MAX)
+    local reachable = timeBudget < math.huge and (ws * CFG.SERVER_DODGE_SPEED_MULT * timeBudget) or math.huge
+    local localRadii = {3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,26,30,36}
+    for _, moveRadius in ipairs(localRadii) do
+        for i = 0, CFG.DODGE_ANGLES - 1 do
+            local angle = startAngle + (i / CFG.DODGE_ANGLES) * math.pi * 2
+            local worldXZ = currentPos + Vector3.new(math.cos(angle) * moveRadius, 0, math.sin(angle) * moveRadius)
+            local offset = flat(worldXZ - targetPos)
+            local candidate, grounded = movementPositionForOffset(offset)
+            if candidate and grounded and not targetBodyOverlapsRootPosition(candidate, 0) then
+                local safe = true
+                for _, th in pairs(S.threats) do
+                    if isInsideThreat(candidate, th, CFG.SAFETY_MARGIN) then
+                        safe = false
+                        break
+                    end
+                end
+                if safe then
+                    local moveDist = flatDistance(candidate, currentPos)
+                    -- Prefer a point reachable before the earliest known impact. If
+                    -- none is reachable, this still returns the closest safe edge so
+                    -- movement begins in the correct direction immediately.
+                    local latePenalty = (reachable < math.huge and moveDist > reachable)
+                        and ((moveDist - reachable) * 25.0) or 0
+                    local score = moveDist * 4.0 + latePenalty + moveRadius * 0.10
+                    if not bestScore or score < bestScore then
+                        bestScore = score
+                        bestOffset = offset
+                        bestReason = S.lastThreatText
+                    end
+                end
+            end
+        end
+    end
+    if bestOffset then
+        return bestOffset, bestReason or "nearest reachable safe edge", true
+    end
+
+    -- Preserve the original close rings as a fallback when the local escape search
+    -- cannot find a valid point (for example a huge multi-AOE overlap).
     local sampleRadii = {}
     for _, r in ipairs(CFG.DODGE_RADII) do table.insert(sampleRadii, r) end
     local largestRadius = sampleRadii[#sampleRadii] or 66
@@ -2025,7 +2093,9 @@ local function chooseDodgeOffset(basePos)
                 local moveDist = flatDistance(candidate, currentPos)
                 local fromBase = flatDistance(candidate, basePos)
                 local inertia = flatMagnitude(currentOffset) > 0.1 and flatDistance(offset, currentOffset) or 0
-                local score = radius * 1.70 + moveDist * 0.12 + fromBase * 0.04 + inertia * 0.08
+                local latePenalty = (reachable < math.huge and moveDist > reachable)
+                    and ((moveDist - reachable) * 25.0) or 0
+                local score = moveDist * 4.0 + latePenalty + radius * 0.20 + fromBase * 0.04 + inertia * 0.05
 
                 if not bestScore or score < bestScore then
                     bestScore = score
@@ -2253,6 +2323,14 @@ local function updateFollower(forceNow)
     local velocity = ensureHoverController()
     if not velocity then return end
 
+    -- The game's own GameLoaded script can keep HumanoidRootPart anchored while
+    -- geometry streams. Never accumulate a movement command during that window.
+    if S.root.Anchored then
+        velocity.VectorVelocity = Vector3.zero
+        S.serverLastGoalDistance = nil
+        return
+    end
+
     local t = clock()
     if not forceNow and t - S.lastFollowUpdate < CFG.FOLLOW_UPDATE_INTERVAL then
         return
@@ -2268,14 +2346,61 @@ local function updateFollower(forceNow)
         inherit = Vector3.new(tv.X, 0, tv.Z)
     end
 
+    local gainXZ = S.dodging and CFG.DODGE_FOLLOW_GAIN_XZ or CFG.FOLLOW_GAIN_XZ
+    local gainY = S.dodging and CFG.DODGE_FOLLOW_GAIN_Y or CFG.FOLLOW_GAIN_Y
+
+    -- Fixed movement profile requested by the user. Keep the Humanoid itself at
+    -- 27.5 WalkSpeed, then derive tracking/dodge velocity caps from that same value.
+    if S.hum and S.hum.Parent and math.abs((tonumber(S.hum.WalkSpeed) or 0) - CFG.FORCED_WALK_SPEED) > 0.01 then
+        pcall(function() S.hum.WalkSpeed = CFG.FORCED_WALK_SPEED end)
+    end
+    local walkSpeed = CFG.SERVER_SPEED_FALLBACK
+    if S.hum and S.hum.Parent then
+        local ok, ws = pcall(function() return tonumber(S.hum.WalkSpeed) end)
+        if ok and ws and ws > 0 then walkSpeed = ws end
+    end
+    walkSpeed = clamp(walkSpeed, CFG.SERVER_SPEED_MIN, CFG.SERVER_SPEED_MAX)
+    S.serverWalkSpeed = walkSpeed
+
+    -- Detect a likely server correction only while chasing a FIXED dodge goal. Normal
+    -- overhead tracking follows a moving mob, so goal-distance increases are expected
+    -- there and must not be interpreted as rubber-banding.
+    if S.dodging and S.dodgeWorldGoal then
+        local goalDist = (S.dodgeWorldGoal - S.root.Position).Magnitude
+        local prev = S.serverLastGoalDistance
+        if prev and goalDist > prev + CFG.SERVER_CORRECTION_DISTANCE then
+            S.serverMoveScale = math.max(
+                CFG.SERVER_CORRECTION_MIN_SCALE,
+                (S.serverMoveScale or 1.0) * CFG.SERVER_CORRECTION_BACKOFF
+            )
+            S.serverLastCorrectionAt = t
+            S.serverCorrectionCount = (S.serverCorrectionCount or 0) + 1
+            S.lastAction = string.format("server correction -> movement %.0f%%", S.serverMoveScale * 100)
+        end
+        S.serverLastGoalDistance = goalDist
+    else
+        S.serverLastGoalDistance = nil
+    end
+
+    if t - (S.serverLastCorrectionAt or -math.huge) >= CFG.SERVER_CORRECTION_RECOVER_DELAY then
+        S.serverMoveScale = math.min(1.0, (S.serverMoveScale or 1.0) + CFG.SERVER_CORRECTION_RECOVER_RATE)
+    end
+
+    local mult = S.dodging and CFG.SERVER_DODGE_SPEED_MULT or CFG.SERVER_TRACK_SPEED_MULT
+    local maxSpeed = walkSpeed * mult * (S.serverMoveScale or 1.0)
+    S.serverMoveCap = maxSpeed
+
     local desired = Vector3.new(
-        error.X * CFG.FOLLOW_GAIN_XZ,
-        error.Y * CFG.FOLLOW_GAIN_Y,
-        error.Z * CFG.FOLLOW_GAIN_XZ
+        error.X * gainXZ,
+        error.Y * gainY,
+        error.Z * gainXZ
     ) + inherit
 
-    if desired.Magnitude > CFG.FOLLOW_MAX_SPEED then
-        desired = desired.Unit * CFG.FOLLOW_MAX_SPEED
+    -- Clamp the FULL 3D velocity, not only XZ. This matters while climbing back to
+    -- overhead height: horizontal + vertical motion together still stays inside the
+    -- same movement budget instead of accidentally exceeding WalkSpeed diagonally.
+    if desired.Magnitude > maxSpeed then
+        desired = desired.Unit * maxSpeed
     end
 
     -- Dead-zone kills tiny correction oscillations that look like character twitch.
@@ -2283,29 +2408,26 @@ local function updateFollower(forceNow)
     if math.abs(error.Y) < 0.10 then desired = Vector3.new(desired.X, 0, desired.Z) end
     if math.abs(error.Z) < 0.12 then desired = Vector3.new(desired.X, desired.Y, inherit.Z) end
 
+    -- A final clamp after dead-zone edits keeps every requested vector inside budget.
+    if desired.Magnitude > maxSpeed then
+        desired = desired.Unit * maxSpeed
+    end
+
     velocity.VectorVelocity = desired
 end
 
-local function teleportTo(pos, action)
-    -- The ONLY positional CFrame write in movement. Called once when a new dodge
-    -- episode begins. Never called again until that dodge has fully cleared.
-    if not S.root or not S.root.Parent then return end
-    local yaw = getYaw(S.root.CFrame)
-    S.root.CFrame = CFrame.new(pos) * CFrame.Angles(0, yaw, 0)
-    S.root.AssemblyLinearVelocity = Vector3.zero
-    S.root.AssemblyAngularVelocity = Vector3.zero
-    S.teleports += 1
-    setHoverGoal(pos)
+local function driveToDodgeGoal(pos, action)
+    -- Server-friendly dodge movement: commit the exact same solver goal, but reach it
+    -- through the already-replicated LinearVelocity follower. No positional CFrame
+    -- write is performed here, so the dodge no longer creates an instant TP for the
+    -- server to correct/rubber-band.
+    if not S.root or not S.root.Parent or not pos then return end
+    setHoverGoal(pos, action)
     updateFollower(true)
-    if action then S.lastAction = action end
 end
 
 local function executeDodgeGoal(pos, action)
-    if isTempleCoreWalkTarget() then
-        walkToGoal(pos, "FLOOR TP " .. (action or "DODGE"), true)
-        return
-    end
-    teleportTo(pos, action)
+    driveToDodgeGoal(pos, action)
 end
 
 local function markThreatsHandled(threats)
@@ -2772,7 +2894,7 @@ local function updateLavaKingSafeZoneOverride(now)
     local dist = flatDistance(S.root.Position, goal)
     local shouldSnap = entering or changed or dist > math.max(2.0, radius * 0.70)
     if shouldSnap and now - (S.lavaKingLastSafeTeleport or -math.huge) >= CFG.LAVA_KING_SAFE_REENTER_INTERVAL then
-        teleportTo(goal, string.format("LAVA KING BOMB -> GREEN SAFE ZONE (r=%.1f)", radius))
+        driveToDodgeGoal(goal, string.format("LAVA KING BOMB -> GREEN SAFE ZONE (r=%.1f)", radius))
         S.lavaKingLastSafeTeleport = now
         S.lavaKingSafeEntries += 1
     else
@@ -3036,6 +3158,7 @@ local function registerExactPrecast(action, a, b, delayUntilAttack, startTime, s
             label = templeCoreCube and "TEMPLE CORE: Water Square (PRE-DAMAGE)" or "PRECAST CUBE",
             cframe = a,
             size = cubeSize,
+            impactAt = clock() + remaining,
             endAt = clock() + hold,
             redodgeEligible = true,
             boss = templeCoreCube and "Temple Core Generator" or nil,
@@ -3068,6 +3191,7 @@ local function registerExactPrecast(action, a, b, delayUntilAttack, startTime, s
             label = templeGuardCircle and "TEMPLE GUARD: Circle AOE" or "PRECAST CIRCLE",
             position = a,
             radius = radius,
+            impactAt = clock() + remaining,
             endAt = clock() + hold,
             redodgeEligible = true,
             templeGuardCircle = templeGuardCircle or nil,
@@ -3678,6 +3802,7 @@ local function handleVolcanicBossEvent(action, args)
                 label = "VOLCANIC: Artillery Lava Walker LANDING",
                 position = landing,
                 radius = CFG.VOLCANIC_ARTILLERY_IMPACT_RADIUS,
+                impactAt = clock() + 0.90, -- 0.15 + 0.25 warmup + 0.50 fall from the decompile
                 endAt = clock() + CFG.VOLCANIC_ARTILLERY_EVENT_HOLD,
                 redodgeEligible = true,
                 artilleryLavaWalker = true,
@@ -4465,8 +4590,8 @@ local function registerVisualPart(part)
         -- The dump shows the real 20x128.3x20 hitBox can touch the character only
         -- a few milliseconds after it is parented. If this exact new part already
         -- covers our current XZ, run the normal dodge state machine immediately
-        -- rather than waiting for the next Heartbeat. This still uses commitDodge /
-        -- performRedodge, so it is a legitimate attack-triggered teleport, not spam.
+        -- rather than waiting for the next Heartbeat. commitDodge / performRedodge
+        -- now redirect the velocity follower; they never position-teleport the root.
         local th = S.threats[id]
         if th and S.root and isInsideThreat(S.root.Position, th, CFG.SAFETY_MARGIN) then
             if not S.dodging then
@@ -5462,6 +5587,9 @@ local function bindCharacter(char)
     S.char = char
     S.hum = char:WaitForChild("Humanoid", 10)
     S.root = char:WaitForChild("HumanoidRootPart", 10)
+    if S.hum then
+        pcall(function() S.hum.WalkSpeed = CFG.FORCED_WALK_SPEED end)
+    end
     S.target = nil
     S.targetRoot = nil
     S.targetHum = nil
@@ -5523,6 +5651,13 @@ local function bindCharacter(char)
             trackNoclipPart(inst)
         end
     end))
+    if S.hum then
+        table.insert(S.charConnections, S.hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if S.hum and S.hum.Parent and math.abs((tonumber(S.hum.WalkSpeed) or 0) - CFG.FORCED_WALK_SPEED) > 0.01 then
+                pcall(function() S.hum.WalkSpeed = CFG.FORCED_WALK_SPEED end)
+            end
+        end))
+    end
     updateNoclip(true)
     setupCombatSignals()
 
@@ -5802,7 +5937,7 @@ local function updateHud()
         hudKV("threats", string.format("%d | P:%d M:%d R:%d E:%d", total, precasts, melee, projectiles, events), threatColor),
         hudKV("ownFX skip", tostring(S.ignoredOwnVisuals or 0), HUD_COLORS.dim),
         hudKV("hold", string.format("%.2fs | off X%+.1f Z%+.1f", holdAge, off.X, off.Z), S.dodging and HUD_COLORS.yellow or HUD_COLORS.dim),
-        hudKV("chain", string.format("blockers %d | teleports %d", S.dodgeBlockerCount or 0, S.dodgeChainTeleports or 0), S.dodging and HUD_COLORS.yellow or HUD_COLORS.dim),
+        hudKV("chain", string.format("blockers %d | redirects %d", S.dodgeBlockerCount or 0, S.dodgeChainTeleports or 0), S.dodging and HUD_COLORS.yellow or HUD_COLORS.dim),
         hudKV("reason", hudShort(S.dodgeReason or "none", 49), S.dodging and HUD_COLORS.yellow or HUD_COLORS.dim),
         hudKV("last threat", hudShort(S.lastThreatText or "none", 45), total > 0 and HUD_COLORS.red or HUD_COLORS.dim),
         hudKV("action", hudShort(S.lastAction or "none", 49), HUD_COLORS.white),
@@ -5811,7 +5946,7 @@ local function updateHud()
         hudKV("replay", hudShort(replayText, 46), replayColor),
         hudKV("Q / E cd", string.format("%.1f / %.1f | casts %d/%d", S.qCooldown or 0, S.eCooldown or 0, S.qCasts or 0, S.eCasts or 0), ((S.qCooldown or 0) <= 0.001 or (S.eCooldown or 0) <= 0.001) and HUD_COLORS.green or HUD_COLORS.yellow),
         hudKV("last cast", hudShort(S.lastCast or "none", 47), (S.lastCast and S.lastCast ~= "none") and HUD_COLORS.green or HUD_COLORS.dim),
-        hudKV("dodges", string.format("%d | teleports %d | orb %d", S.dodgeCount or 0, S.teleports or 0, S.homingOrbDodges or 0), HUD_COLORS.cyan),
+        hudKV("dodges", string.format("%d | cap %.1f | rb %d", S.dodgeCount or 0, S.serverMoveCap or 0, S.serverCorrectionCount or 0), HUD_COLORS.cyan),
         hudKV("safety", "XZ-ONLY / Y never grants immunity", HUD_COLORS.orange),
     }
 
@@ -6478,4 +6613,4 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 S.lastAction = "ready"
-print("[DQ Adaptive Chain Dodger] loaded - boot-safe hooks + reliable auto-ready/start + native replay + current dodge fixes.")
+print("[DQ Adaptive Chain Dodger] loaded - boot-safe + native replay + server-speed adaptive overhead dodging (no positional TP).")
