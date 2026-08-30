@@ -47,8 +47,8 @@ local CFG = {
     -- consistently treats Humanoid.WalkSpeed as the live movement-speed state.
     -- Never request faster replicated movement than that live server-owned value.
     FOLLOW_MAX_FORCE = 30000,
-    FORCED_WALK_SPEED = 35,
-    SERVER_SPEED_FALLBACK = 35,
+    FORCED_WALK_SPEED = 27.5,
+    SERVER_SPEED_FALLBACK = 27.5,
     SERVER_TRACK_SPEED_MULT = 1.00,
     SERVER_DODGE_SPEED_MULT = 1.00,
     SERVER_SPEED_MIN = 4.0,
@@ -109,6 +109,16 @@ local CFG = {
     DODGE_ANGLES = 24,                 -- ORIGINAL dodge sampling / feel
     SAFETY_MARGIN = 4.5,
     DODGE_CLEARANCE_REWARD = 0.62,     -- among equally-close safe points, prefer the one deeper inside free space
+    -- Strategic combat-preserving dodge scoring. Safety/reachability come first, but
+    -- among safe choices hug the current enemy so Q/E stay in range and directional
+    -- casts continue landing instead of fleeing to an unnecessarily distant ring.
+    STRATEGIC_DODGE = true,
+    STRATEGIC_COMBAT_RANGE_BUFFER = 2.0, -- target <= COMBAT_MAX_XZ_RANGE - this whenever possible
+    STRATEGIC_TARGET_DIST_WEIGHT = 12.0, -- strongest tie-breaker: stay close to enemy
+    STRATEGIC_MOVE_DIST_WEIGHT = 1.15,   -- then prefer a short server-accepted route
+    STRATEGIC_INERTIA_WEIGHT = 0.10,
+    STRATEGIC_CLEARANCE_REWARD = 0.18,  -- small reward only; never flee far just for clearance
+    STRATEGIC_ROUTE_STEP = 2.5,
     PROJECTILE_PREDICT_TIME = 0.70,
     PROJECTILE_EXTRA_LOOKAHEAD = 0.35, -- reserve a little farther down moving projectile paths
     PROJECTILE_LATENCY_PAD_TIME = 0.075,-- convert projectile speed into a small replication/latency position pad
@@ -1970,8 +1980,14 @@ isPositionSafe = function(pos, margin)
     return true
 end
 
--- ORIGINAL live-target solver. Keep this byte-for-byte behaviorally equivalent to
--- the version from before replay/post-kill work changed normal dodge selection.
+-- Strategic live-target solver.
+-- Safety is mandatory, then we rank safe points by:
+--   1) reachable before the known impact,
+--   2) still inside combat range,
+--   3) smallest XZ distance to the target,
+--   4) shortest movement from the current position.
+-- This prevents the non-teleport build from "escaping" to a safe point that is much
+-- farther from the mob than necessary and then wasting Q/E because it is out of range.
 local function chooseDodgeOffset(basePos)
     if not S.targetRoot then return Vector3.zero, "no-target" end
 
@@ -1991,10 +2007,9 @@ local function chooseDodgeOffset(basePos)
         end
     end
 
-    -- Server-speed mode: before considering boss-centered rings, search compact
-    -- offsets around the CURRENT character position. With no teleport, the nearest
-    -- safe edge is what matters; asking for a point 40+ studs away only wastes the
-    -- attack's warning time even though velocity itself is capped.
+    -- Earliest authoritative impact time among threats that currently cover us.
+    -- Known precasts/artillery events therefore prefer points we can physically reach
+    -- at the server-accepted 27.5 studs/s movement budget.
     local timeBudget = math.huge
     local nowForReach = clock()
     for _, th in pairs(S.threats) do
@@ -2005,46 +2020,126 @@ local function chooseDodgeOffset(basePos)
     local ws = (S.hum and tonumber(S.hum.WalkSpeed)) or CFG.SERVER_SPEED_FALLBACK
     ws = clamp(ws, CFG.SERVER_SPEED_MIN, CFG.SERVER_SPEED_MAX)
     local reachable = timeBudget < math.huge and (ws * CFG.SERVER_DODGE_SPEED_MULT * timeBudget) or math.huge
-    local localRadii = {3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,26,30,36}
+    local combatLimit = math.max(4, CFG.COMBAT_MAX_XZ_RANGE - CFG.STRATEGIC_COMBAT_RANGE_BUFFER)
+
+    -- Because we no longer teleport, endpoint safety alone is not enough: avoid
+    -- selecting a close point on the opposite side of a different active attack.
+    -- If we START inside a threat, allow the route to leave it once, but never re-enter.
+    local function routeSafe(candidate)
+        if not candidate then return false end
+        local dist = flatDistance(currentPos, candidate)
+        if dist <= 0.15 then return true end
+
+        local samples = math.max(2, math.ceil(dist / CFG.STRATEGIC_ROUTE_STEP))
+        local startInside = {}
+        local exited = {}
+        for id, th in pairs(S.threats) do
+            if isInsideThreat(currentPos, th, CFG.SAFETY_MARGIN) then
+                startInside[id] = true
+            end
+        end
+
+        for i = 1, samples do
+            local a = i / samples
+            local probe = Vector3.new(
+                currentPos.X + (candidate.X - currentPos.X) * a,
+                candidate.Y,
+                currentPos.Z + (candidate.Z - currentPos.Z) * a
+            )
+            if targetBodyOverlapsRootPosition(probe, 0) then
+                return false
+            end
+            for id, th in pairs(S.threats) do
+                local inside = isInsideThreat(probe, th, CFG.SAFETY_MARGIN)
+                if startInside[id] then
+                    if not inside then
+                        exited[id] = true
+                    elseif exited[id] then
+                        return false
+                    end
+                elseif inside then
+                    return false
+                end
+            end
+        end
+        return true
+    end
+
+    local function consider(offset, candidate, grounded, reason)
+        if not candidate or not grounded or targetBodyOverlapsRootPosition(candidate, 0) then
+            return
+        end
+
+        local safe = true
+        local minClearance = math.huge
+        for _, th in pairs(S.threats) do
+            if isInsideThreat(candidate, th, CFG.SAFETY_MARGIN) then
+                safe = false
+            end
+            minClearance = math.min(minClearance, adjustedThreatClearance(candidate, th, CFG.SAFETY_MARGIN))
+        end
+
+        if minClearance > fallbackClearance then
+            fallbackClearance = minClearance
+            fallbackOffset = offset
+        end
+        if not safe or not routeSafe(candidate) then
+            return
+        end
+
+        local moveDist = flatDistance(candidate, currentPos)
+        local targetDist = flatDistance(candidate, targetPos)
+        local inertia = flatMagnitude(currentOffset) > 0.1 and flatDistance(offset, currentOffset) or 0
+        local reachableNow = reachable == math.huge or moveDist <= reachable + 0.75
+        local inCombat = targetDist <= combatLimit
+
+        -- Lexicographic priority encoded as large score bands:
+        -- reachable+in-range > reachable > in-range-but-late > any other safe point.
+        local tier
+        if reachableNow and inCombat then
+            tier = 0
+        elseif reachableNow then
+            tier = 1
+        elseif inCombat then
+            tier = 2
+        else
+            tier = 3
+        end
+
+        local late = reachable < math.huge and math.max(0, moveDist - reachable) or 0
+        local clearanceReward = minClearance < math.huge and math.min(12, math.max(-8, minClearance)) or 0
+        local score = tier * 1000000
+            + targetDist * CFG.STRATEGIC_TARGET_DIST_WEIGHT
+            + moveDist * CFG.STRATEGIC_MOVE_DIST_WEIGHT
+            + inertia * CFG.STRATEGIC_INERTIA_WEIGHT
+            + late * 35.0
+            - clearanceReward * CFG.STRATEGIC_CLEARANCE_REWARD
+
+        if not bestScore or score < bestScore then
+            bestScore = score
+            bestOffset = offset
+            bestReason = reason or S.lastThreatText
+        end
+    end
+
+    -- Search around the CURRENT position first so we include tiny escape steps, but
+    -- do not return early. Target-centered rings below are allowed to beat these if
+    -- they keep us closer to the enemy while remaining reachable and route-safe.
+    local localRadii = {2.5,3,4,5,6,7,8,9,10,11,12,14,16,18,20,22,26,30,36}
     for _, moveRadius in ipairs(localRadii) do
         for i = 0, CFG.DODGE_ANGLES - 1 do
             local angle = startAngle + (i / CFG.DODGE_ANGLES) * math.pi * 2
             local worldXZ = currentPos + Vector3.new(math.cos(angle) * moveRadius, 0, math.sin(angle) * moveRadius)
             local offset = flat(worldXZ - targetPos)
             local candidate, grounded = movementPositionForOffset(offset)
-            if candidate and grounded and not targetBodyOverlapsRootPosition(candidate, 0) then
-                local safe = true
-                for _, th in pairs(S.threats) do
-                    if isInsideThreat(candidate, th, CFG.SAFETY_MARGIN) then
-                        safe = false
-                        break
-                    end
-                end
-                if safe then
-                    local moveDist = flatDistance(candidate, currentPos)
-                    -- Prefer a point reachable before the earliest known impact. If
-                    -- none is reachable, this still returns the closest safe edge so
-                    -- movement begins in the correct direction immediately.
-                    local latePenalty = (reachable < math.huge and moveDist > reachable)
-                        and ((moveDist - reachable) * 25.0) or 0
-                    local score = moveDist * 4.0 + latePenalty + moveRadius * 0.10
-                    if not bestScore or score < bestScore then
-                        bestScore = score
-                        bestOffset = offset
-                        bestReason = S.lastThreatText
-                    end
-                end
-            end
+            consider(offset, candidate, grounded, S.lastThreatText)
         end
     end
-    if bestOffset then
-        return bestOffset, bestReason or "nearest reachable safe edge", true
-    end
 
-    -- Preserve the original close rings as a fallback when the local escape search
-    -- cannot find a valid point (for example a huge multi-AOE overlap).
-    local sampleRadii = {}
-    for _, r in ipairs(CFG.DODGE_RADII) do table.insert(sampleRadii, r) end
+    -- Boss-centered rings make "closest safe point to the enemy" explicit. Include
+    -- tighter radii than the old teleport-oriented solver because the body-overlap
+    -- test already rejects points that are physically too close to the model.
+    local sampleRadii = {2.5,3,4,5,6,7,8,9,10,12,15,18,22,27,33,42,54,66}
     local largestRadius = sampleRadii[#sampleRadii] or 66
     local requiredRadius = largestRadius
     for _, th in pairs(S.threats) do
@@ -2069,45 +2164,12 @@ local function chooseDodgeOffset(basePos)
             local angle = startAngle + (i / CFG.DODGE_ANGLES) * math.pi * 2
             local offset = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
             local candidate, grounded = movementPositionForOffset(offset)
-            if not candidate then
-                continue
-            end
-
-            local safe = grounded and (isTempleCoreWalkTarget() or not targetBodyOverlapsRootPosition(candidate, 0))
-            local minClearance = math.huge
-            local offender
-            for _, th in pairs(S.threats) do
-                if isInsideThreat(candidate, th, CFG.SAFETY_MARGIN) then
-                    safe = false
-                    offender = th
-                end
-                minClearance = math.min(minClearance, threatClearance(candidate, th))
-            end
-
-            if minClearance > fallbackClearance then
-                fallbackClearance = minClearance
-                fallbackOffset = offset
-            end
-
-            if safe then
-                local moveDist = flatDistance(candidate, currentPos)
-                local fromBase = flatDistance(candidate, basePos)
-                local inertia = flatMagnitude(currentOffset) > 0.1 and flatDistance(offset, currentOffset) or 0
-                local latePenalty = (reachable < math.huge and moveDist > reachable)
-                    and ((moveDist - reachable) * 25.0) or 0
-                local score = moveDist * 4.0 + latePenalty + radius * 0.20 + fromBase * 0.04 + inertia * 0.05
-
-                if not bestScore or score < bestScore then
-                    bestScore = score
-                    bestOffset = offset
-                    bestReason = offender and (offender.label or offender.kind) or S.lastThreatText
-                end
-            end
+            consider(offset, candidate, grounded, S.lastThreatText)
         end
     end
 
     return bestOffset or fallbackOffset or Vector3.new(CFG.DODGE_RADII[#CFG.DODGE_RADII], 0, 0),
-           bestReason or "max-clearance",
+           bestReason or (bestOffset and "strategic close-safe" or "max-clearance"),
            bestOffset ~= nil
 end
 
@@ -2208,25 +2270,36 @@ local function chooseHomingDodgeOffset(th, basePos)
     local side = Vector3.new(-approach.Z, 0, approach.X)
     local targetPos = S.targetRoot.Position
     local current = S.root.Position
+    local combatLimit = math.max(4, CFG.COMBAT_MAX_XZ_RANGE - CFG.STRATEGIC_COMBAT_RANGE_BUFFER)
+    local bestOffset, bestScore
 
-    local options = {}
-    for _, dist in ipairs({CFG.SEARING_ORB_SIDE_STEP, CFG.SEARING_ORB_SIDE_STEP_FAR}) do
-        table.insert(options, current + side * dist)
-        table.insert(options, current - side * dist)
-    end
-    table.sort(options, function(a, b)
-        return flatDistance(a, orbPos) > flatDistance(b, orbPos)
-    end)
-
-    for _, world in ipairs(options) do
-        local rawOffset = flat(world - targetPos)
-        local candidate, grounded = movementPositionForOffset(rawOffset)
-        if grounded and candidate and isPositionSafe(candidate, CFG.SAFETY_MARGIN) then
-            local offset = flat(candidate - targetPos)
-            return offset, "SEARING ORB -> perpendicular sidestep", true
+    -- Perpendicular movement still makes a steering orb turn, but with normal-speed
+    -- movement a fixed 64/84-stud "sidestep" is too slow and leaves combat range.
+    -- Search short side-steps first and only use the old long distances if required.
+    local distances = {6,8,10,12,14,16,18,20,24,28,32,40,48,CFG.SEARING_ORB_SIDE_STEP,CFG.SEARING_ORB_SIDE_STEP_FAR}
+    for _, dist in ipairs(distances) do
+        for _, sign in ipairs({1, -1}) do
+            local world = current + side * (dist * sign)
+            local rawOffset = flat(world - targetPos)
+            local candidate, grounded = movementPositionForOffset(rawOffset)
+            if grounded and candidate and isPositionSafe(candidate, CFG.SAFETY_MARGIN) then
+                local targetDist = flatDistance(candidate, targetPos)
+                local moveDist = flatDistance(candidate, current)
+                local inCombat = targetDist <= combatLimit
+                local score = (inCombat and 0 or 1000000) + targetDist * 12.0 + moveDist * 1.2
+                -- Prefer the side that actually increases separation from the orb.
+                score -= math.min(40, flatDistance(candidate, orbPos)) * 0.12
+                if not bestScore or score < bestScore then
+                    bestScore = score
+                    bestOffset = flat(candidate - targetPos)
+                end
+            end
         end
     end
 
+    if bestOffset then
+        return bestOffset, "SEARING ORB -> close combat sidestep", true
+    end
     return chooseDodgeOffset(basePos)
 end
 
