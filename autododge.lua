@@ -3750,29 +3750,46 @@ local function hookMapEvents()
     local remotes = ReplicatedStorage:FindFirstChild("remotes")
     if not remotes then return end
 
-    for _, remoteName in ipairs(MAP_EVENT_REMOTES) do
-        local remote = remotes:FindFirstChild(remoteName)
-        if remote and remote:IsA("RemoteEvent") then
-            remote.OnClientEvent:Connect(function(...)
-                local args = table.pack(...)
-                local action = type(args[1]) == "string" and args[1] or remoteName
-                local handledSpecial = false
-                if remoteName == "miyamotoClientEvents" then
-                    handledSpecial = handleMiyamotoEvent(action, args)
-                elseif remoteName == "aquaticBossSpecficEvents" then
-                    handledSpecial = handleAquaticTempleEvent(action, args)
-                elseif remoteName == "volcanicBossSpecficEvents" then
-                    handledSpecial = handleVolcanicBossEvent(action, args)
-                end
-                if not handledSpecial then
-                    inferEventThreat(action, args)
-                end
-                if CFG.PRINT_EVENTS then
-                    print("[DQ Dodge][MapEvent]", remoteName, action, ...)
-                end
-            end)
+    -- Remotes can finish replicating after an auto-executed script begins. Keep this
+    -- hook idempotent and attach map-specific boss remotes that arrive late too.
+    local hooked = setmetatable({}, {__mode = "k"})
+    local function attach(remote, remoteName)
+        if not remote or not remote:IsA("RemoteEvent") or hooked[remote] then return end
+        hooked[remote] = true
+        remote.OnClientEvent:Connect(function(...)
+            local args = table.pack(...)
+            local action = type(args[1]) == "string" and args[1] or remoteName
+            local handledSpecial = false
+            if remoteName == "miyamotoClientEvents" then
+                handledSpecial = handleMiyamotoEvent(action, args)
+            elseif remoteName == "aquaticBossSpecficEvents" then
+                handledSpecial = handleAquaticTempleEvent(action, args)
+            elseif remoteName == "volcanicBossSpecficEvents" then
+                handledSpecial = handleVolcanicBossEvent(action, args)
+            end
+            if not handledSpecial then
+                inferEventThreat(action, args)
+            end
+            if CFG.PRINT_EVENTS then
+                print("[DQ Dodge][MapEvent]", remoteName, action, ...)
+            end
+        end)
+    end
+
+    local function tryAttach(remote)
+        if not remote then return end
+        for _, remoteName in ipairs(MAP_EVENT_REMOTES) do
+            if remote.Name == remoteName then
+                attach(remote, remoteName)
+                return
+            end
         end
     end
+
+    for _, remoteName in ipairs(MAP_EVENT_REMOTES) do
+        attach(remotes:FindFirstChild(remoteName), remoteName)
+    end
+    remotes.ChildAdded:Connect(tryAttach)
 end
 
 --// Newly-created transient attack geometry / projectiles
@@ -5973,27 +5990,40 @@ do
     R.hook = function()
         if not CFG.AUTO_REPLAY_ENABLED then
             S.replayStatus = "OFF"
-            return
+            return true
         end
+        if R.hooked then return true end
 
-        S.replayStatus = "armed / native replayDungeon"
         local remotes = ReplicatedStorage:FindFirstChild("remotes")
-        local complete = remotes and remotes:FindFirstChild("loadCompleteGui")
-        local reward = remotes and remotes:FindFirstChild("cloneRewardGui")
-
-        if complete and complete:IsA("RemoteEvent") then
-            complete.OnClientEvent:Connect(function()
-                R.markComplete("loadCompleteGui")
-            end)
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not remotes or not pg then
+            S.replayStatus = "boot: waiting for game UI/remotes"
+            return false
         end
 
-        if reward and reward:IsA("RemoteEvent") then
-            reward.OnClientEvent:Connect(function(payload)
-                R.markReward(payload)
-            end)
+        R.hooked = true
+        R.remoteHooks = {}
+        S.replayStatus = "armed / native replayDungeon"
+
+        R.connectRemote = function(remote)
+            if not remote or not remote:IsA("RemoteEvent") or R.remoteHooks[remote] then return end
+            if remote.Name == "loadCompleteGui" then
+                R.remoteHooks[remote] = remote.OnClientEvent:Connect(function()
+                    R.markComplete("loadCompleteGui")
+                end)
+            elseif remote.Name == "cloneRewardGui" then
+                R.remoteHooks[remote] = remote.OnClientEvent:Connect(function(payload)
+                    R.markReward(payload)
+                end)
+            end
         end
 
-        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+        R.connectRemote(remotes:FindFirstChild("loadCompleteGui"))
+        R.connectRemote(remotes:FindFirstChild("cloneRewardGui"))
+        remotes.ChildAdded:Connect(function(child)
+            R.connectRemote(child)
+        end)
+
         pg.ChildAdded:Connect(function(child)
             if lower(child.Name) == "completegui" then
                 R.markComplete("completeGui")
@@ -6003,12 +6033,30 @@ do
             R.markComplete("existing completeGui")
         end
 
-        local progress = workspace:FindFirstChild("dungeonProgress")
-        if progress then R.hookFinished(progress) end
-        local dungeon = workspace:FindFirstChild("dungeon")
-        local bossRoom = dungeon and dungeon:FindFirstChild("bossRoom")
-        local finished = bossRoom and bossRoom:FindFirstChild("dungeonFinished")
-        if finished then R.hookFinished(finished) end
+        R.hookedFinishedValues = setmetatable({}, {__mode = "k"})
+        R.tryHookFinished = function(value)
+            if not value or not value:IsA("ValueBase") or R.hookedFinishedValues[value] then return end
+            R.hookedFinishedValues[value] = true
+            R.hookFinished(value)
+        end
+
+        R.tryHookFinished(workspace:FindFirstChild("dungeonProgress"))
+        workspace.ChildAdded:Connect(function(child)
+            if child.Name == "dungeonProgress" then R.tryHookFinished(child) end
+        end)
+
+        task.spawn(function()
+            while not R.teleporting do
+                local dungeon = workspace:FindFirstChild("dungeon")
+                local bossRoom = dungeon and dungeon:FindFirstChild("bossRoom")
+                local finished = bossRoom and bossRoom:FindFirstChild("dungeonFinished")
+                if finished then
+                    R.tryHookFinished(finished)
+                    break
+                end
+                task.wait(0.5)
+            end
+        end)
 
         pcall(function()
             LocalPlayer.OnTeleport:Connect(function(state)
@@ -6032,95 +6080,256 @@ do
                 S.replayStatus = "native replay failed"
             end
         end)
+        return true
     end
 
-    R.hook()
+    -- Auto-executors can run before ReplicatedStorage/PlayerGui finish replicating.
+    -- Retry installation until the real game objects exist instead of permanently
+    -- missing the reward/completion remotes on an early injection.
+    task.spawn(function()
+        while not R.hook() do
+            task.wait(0.20)
+        end
+    end)
 end
 
---// Auto start / auto ready
--- Event-only: this block does not run a polling movement loop and cannot interfere
--- with dodge timing. It mirrors the decompiled readyButton/startButton remotes.
+--// Auto start / auto ready -- boot-safe version
+-- Decompiled behavior:
+--   readyButton -> remotes.readyUp while dungeonProgress == "playersNotReady"
+--   startButton -> remotes.changeStartValue after workspace.start + Utility exist
+--   accepted Start -> loadCountdownGui removes startButton.
+-- Do NOT one-shot these calls: early injection can reach the client before replication
+-- is complete, and a successful FireServer() call does not prove the server accepted it.
 do
     local A = {
-        startSent = false,
-        readySent = false,
+        remotes = nil,
+        pg = nil,
+        pm = nil,
+        installed = false,
+        sawStartPrompt = false,
+        sawReadyPrompt = false,
+        countdownSeen = false,
+        lastReadyAt = -math.huge,
+        lastStartAt = -math.huge,
+        readyAttempts = 0,
+        startAttempts = 0,
+        status = "booting",
     }
 
-    A.remotes = ReplicatedStorage:FindFirstChild("remotes")
+    A.refresh = function()
+        A.remotes = ReplicatedStorage:FindFirstChild("remotes")
+        A.pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not A.pm then
+            local utility = ReplicatedStorage:FindFirstChild("Utility")
+            local module = utility and utility:FindFirstChild("PlaceManager")
+            if module then
+                pcall(function() A.pm = require(module) end)
+            end
+        end
+        return A.remotes ~= nil and A.pg ~= nil
+    end
 
-    A.ready = function(source)
-        if not CFG.AUTO_START_ENABLED or A.readySent then return end
-        local progress = workspace:FindFirstChild("dungeonProgress")
-        if not progress or tostring(progress.Value) ~= "playersNotReady" then return end
+    A.progress = function()
+        local v = workspace:FindFirstChild("dungeonProgress")
+        return v and tostring(v.Value) or nil
+    end
 
+    A.started = function()
+        if A.countdownSeen then return true end
+        local startValue = workspace:FindFirstChild("start")
+        if startValue and startValue:IsA("BoolValue") and startValue.Value == true then return true end
+        local dungeonStarted = workspace:FindFirstChild("dungeonStarted")
+        if dungeonStarted and dungeonStarted:IsA("BoolValue") and dungeonStarted.Value == true then return true end
+        local p = A.progress()
+        return p == "inProgress" or p == "bossKilled"
+    end
+
+    A.isOwner = function()
+        if A.pm and type(A.pm.GetDungeonOwnerId) == "function" then
+            local ok, id = pcall(function() return A.pm.GetDungeonOwnerId() end)
+            if ok and tonumber(id) then return tonumber(id) == LocalPlayer.UserId end
+        end
+        -- The server sends showStartButton only to a client allowed to press Start,
+        -- so an existing/past Start prompt is also authoritative owner evidence.
+        return A.sawStartPrompt or (A.pg and A.pg:FindFirstChild("startButton") ~= nil)
+    end
+
+    A.allReady = function()
+        local players = Players:GetPlayers()
+        if #players == 0 then return false end
+        for _, player in ipairs(players) do
+            local ready = player:FindFirstChild("ready")
+            if not ready or not ready:IsA("BoolValue") or ready.Value ~= true then
+                return false
+            end
+        end
+        return true
+    end
+
+    A.tryReady = function(source)
+        if not CFG.AUTO_START_ENABLED or A.started() then return false end
+        if A.progress() ~= "playersNotReady" then return false end
         local readyValue = LocalPlayer:FindFirstChild("ready")
         if readyValue and readyValue:IsA("BoolValue") and readyValue.Value == true then
-            A.readySent = true
-            return
+            A.status = "ready confirmed"
+            return true
         end
-
+        local now = clock()
+        if now - A.lastReadyAt < 0.85 then return false end
         local remote = A.remotes and A.remotes:FindFirstChild("readyUp")
-        if not remote or not remote:IsA("RemoteEvent") then return end
-        A.readySent = true
-        pcall(function() remote:FireServer() end)
-        S.lastAction = "AUTO READY -> readyUp (" .. tostring(source or "prompt") .. ")"
+        if not remote or not remote:IsA("RemoteEvent") then
+            A.status = "waiting readyUp"
+            return false
+        end
+        A.lastReadyAt = now
+        A.readyAttempts += 1
+        local ok = pcall(function() remote:FireServer() end)
+        A.status = ok and "ready sent / awaiting confirm" or "ready send failed"
+        S.lastAction = "AUTO READY -> readyUp (" .. tostring(source or "supervisor") .. ")"
+        return ok
     end
 
-    A.start = function(source)
-        if not CFG.AUTO_START_ENABLED or A.startSent then return end
+    A.tryStart = function(source)
+        if not CFG.AUTO_START_ENABLED or A.started() then return false end
+        if not A.isOwner() then return false end
+
+        -- Prefer the exact server-created Start prompt. If we somehow missed that event
+        -- because the executor injected too early, owner + all-ready is the fallback.
+        local promptPresent = A.pg and A.pg:FindFirstChild("startButton") ~= nil
+        if not promptPresent and not A.sawStartPrompt and not A.allReady() then return false end
+
         local startValue = workspace:FindFirstChild("start")
-        if startValue and startValue:IsA("BoolValue") and startValue.Value == true then
-            A.startSent = true
-            return
+        local utility = ReplicatedStorage:FindFirstChild("Utility")
+        if not startValue or not startValue:IsA("BoolValue") or not utility then
+            A.status = "waiting start state"
+            return false
         end
 
+        local now = clock()
+        -- Give the server plenty of time to replicate start/countdown before retrying;
+        -- this avoids a second call racing an accepted first call.
+        if now - A.lastStartAt < 1.75 then return false end
         local remote = A.remotes and A.remotes:FindFirstChild("changeStartValue")
-        if not remote or not remote:IsA("RemoteEvent") then return end
-        A.startSent = true
-        pcall(function() remote:FireServer() end)
-        S.lastAction = "AUTO START -> changeStartValue (" .. tostring(source or "prompt") .. ")"
+        if not remote or not remote:IsA("RemoteEvent") then
+            A.status = "waiting changeStartValue"
+            return false
+        end
+
+        A.lastStartAt = now
+        A.startAttempts += 1
+        local ok = pcall(function() remote:FireServer() end)
+        A.status = ok and "start sent / awaiting countdown" or "start send failed"
+        S.lastAction = "AUTO START -> changeStartValue (" .. tostring(source or "supervisor") .. ")"
+        return ok
     end
 
-    if CFG.AUTO_START_ENABLED and A.remotes then
-        local showReady = A.remotes:FindFirstChild("showReadyGui")
-        local showStart = A.remotes:FindFirstChild("showStartButton")
+    A.install = function()
+        if A.installed then return true end
+        if not A.refresh() then
+            A.status = "waiting game replication"
+            return false
+        end
+        A.installed = true
 
-        if showReady and showReady:IsA("RemoteEvent") then
-            showReady.OnClientEvent:Connect(function()
-                task.defer(function() A.ready("showReadyGui") end)
-            end)
+        A.connectRemote = function(remote)
+            if not remote or not remote:IsA("RemoteEvent") then return end
+            if remote.Name == "showReadyGui" then
+                remote.OnClientEvent:Connect(function()
+                    A.sawReadyPrompt = true
+                    task.defer(function() A.tryReady("showReadyGui") end)
+                end)
+            elseif remote.Name == "showStartButton" then
+                remote.OnClientEvent:Connect(function()
+                    A.sawStartPrompt = true
+                    task.defer(function() A.tryStart("showStartButton") end)
+                end)
+            elseif remote.Name == "loadCountdownGui" then
+                remote.OnClientEvent:Connect(function()
+                    A.countdownSeen = true
+                    A.status = "countdown / started"
+                    S.lastAction = "AUTO START confirmed -> countdown"
+                end)
+            end
         end
 
-        if showStart and showStart:IsA("RemoteEvent") then
-            showStart.OnClientEvent:Connect(function()
-                task.defer(function() A.start("showStartButton") end)
-            end)
-        end
+        A.connectRemote(A.remotes:FindFirstChild("showReadyGui"))
+        A.connectRemote(A.remotes:FindFirstChild("showStartButton"))
+        A.connectRemote(A.remotes:FindFirstChild("loadCountdownGui"))
+        A.remotes.ChildAdded:Connect(function(child)
+            A.connectRemote(child)
+        end)
 
-        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
-        pg.ChildAdded:Connect(function(child)
+        A.pg.ChildAdded:Connect(function(child)
             local n = lower(child.Name)
             if n == "readybutton" then
-                task.defer(function() A.ready("readyButton") end)
+                A.sawReadyPrompt = true
+                task.defer(function() A.tryReady("readyButton") end)
             elseif n == "startbutton" then
-                task.defer(function() A.start("startButton") end)
+                A.sawStartPrompt = true
+                task.defer(function() A.tryStart("startButton") end)
+            elseif n == "countdowngui" then
+                A.countdownSeen = true
+                A.status = "countdown / started"
             end
         end)
 
-        -- Covers script injection after the prompt already exists.
-        if pg:FindFirstChild("readyButton") then task.defer(function() A.ready("existing readyButton") end) end
-        if pg:FindFirstChild("startButton") then task.defer(function() A.start("existing startButton") end) end
+        if A.pg:FindFirstChild("readyButton") then A.sawReadyPrompt = true end
+        if A.pg:FindFirstChild("startButton") then A.sawStartPrompt = true end
+        if A.pg:FindFirstChild("countDownGui") or A.pg:FindFirstChild("countdownGui") then
+            A.countdownSeen = true
+        end
+        return true
     end
+
+    task.spawn(function()
+        -- Installation retry handles scripts auto-executed before remotes/PlayerGui exist.
+        while CFG.AUTO_START_ENABLED and not A.install() do
+            task.wait(0.20)
+        end
+        if not CFG.AUTO_START_ENABLED then return end
+
+        -- Low-frequency supervisor runs only during the pre-start phase. It catches
+        -- missed UI events and confirms server state before considering a call done.
+        while not A.started() do
+            A.refresh()
+            A.tryReady("state supervisor")
+            A.tryStart("state supervisor")
+            task.wait(0.25)
+        end
+        A.status = "started"
+    end)
 end
 
---// Hooks
-hookPrecasts()
-hookMapEvents()
-hookLocalAbilityVisualEvents()
-hookTransientVisuals()
-task.defer(function()
-    scanRenderedPrecastCircles(true)
-end)
+--// Boot-safe hooks
+-- Auto-execution can occur before Utility/remotes/BridgeNet2 are replicated. The old
+-- one-shot hook calls would silently give up forever in that case, which also made
+-- dodging appear randomly broken on some teleports.
+do
+    local B = {installed = false}
+    task.spawn(function()
+        while not B.installed do
+            local remotes = ReplicatedStorage:FindFirstChild("remotes")
+            local utility = ReplicatedStorage:FindFirstChild("Utility")
+            local bridge = utility and utility:FindFirstChild("BridgeNet2")
+            local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            if remotes and utility and bridge and pg then
+                -- Let the rest of the replicated children settle for one scheduler beat.
+                task.wait(0.20)
+                hookPrecasts()
+                hookMapEvents()
+                hookLocalAbilityVisualEvents()
+                hookTransientVisuals()
+                B.installed = true
+                task.defer(function()
+                    scanRenderedPrecastCircles(true)
+                end)
+            else
+                S.lastAction = "BOOT WAIT -> remotes / Utility / BridgeNet2 / PlayerGui"
+                task.wait(0.20)
+            end
+        end
+    end)
+end
 
 --// Character orientation aim
 -- Character pitch/yaw is updated from the main Heartbeat after movement.
@@ -6190,4 +6399,4 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 S.lastAction = "ready"
-print("[DQ Adaptive Chain Dodger] loaded - ORIGINAL live-target dodge feel + isolated post-kill watch + Lava King safe zone + native replay + auto-start.")
+print("[DQ Adaptive Chain Dodger] loaded - boot-safe hooks + reliable auto-ready/start + native replay + current dodge fixes.")
