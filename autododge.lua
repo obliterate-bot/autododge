@@ -167,6 +167,15 @@ local CFG = {
     VOLCANIC_EXPLOSIVE_WALKER_EVENT_RADIUS = 34.0,
     VOLCANIC_EXPLOSIVE_WALKER_EVENT_HOLD = 1.65,
 
+    -- Artillery Lava Walker. Decompiled volcanicBossSpecficEvents("Artillery Mob Shot", payload)
+    -- gives payload[2] = the LOCKED landing CFrame immediately. The client then waits
+    -- 0.40s, spawns artilleryRock 100 studs above that XZ, and tweens it down for 0.50s.
+    -- Reserve the landing circle from the event itself instead of waiting for the rock visual.
+    VOLCANIC_ARTILLERY_IMPACT_RADIUS = 22.0,
+    VOLCANIC_ARTILLERY_EVENT_HOLD = 1.45,       -- covers 0.40 + 0.50 travel + impact/removal grace
+    VOLCANIC_ARTILLERY_POST_REMOVE = 0.65,
+    VOLCANIC_ARTILLERY_MAX_LIFE = 2.20,
+
     -- Volcanic Chambers / Lava King bomb mechanic. The decompiled client spawns
     -- six `thirdBossCurseRing` parts on the cursed character for 6 seconds. The
     -- bomb is cancelled only by entering the small green safe zone, so this
@@ -3638,6 +3647,48 @@ end
 -- in 0.4s.  The remote is a detonation visual, not a useful pre-warning: in the
 -- recorded death, HP reached 0 on the same frame this event was observed.
 local function handleVolcanicBossEvent(action, args)
+    -- Artillery Lava Walker exact impact targeting. Decompiled mapSpecificLocals:
+    --   payload[1] = Artillery Lava Walker model
+    --   payload[2] = locked landing CFrame
+    --   wait(0.15) + wait(0.25), then artilleryRock starts 100 studs above payload[2]
+    --   and reaches payload[2] in another 0.50s.
+    -- Generic event inference recursively scans payload tables and can pick payload[1]
+    -- (the SHOOTER position) before payload[2], so handle this action explicitly.
+    if action == "Artillery Mob Shot" then
+        local payload = args[2]
+        local landing
+        if type(payload) == "table" then
+            landing = extractPositionFromValue(payload[2])
+        end
+        if not landing then
+            -- Defensive fallback for alternate server payload shapes: prefer the last
+            -- positional argument, since the decompiled canonical shape puts target last.
+            local n = args.n or #args
+            for i = n, 2, -1 do
+                landing = extractPositionFromValue(args[i])
+                if landing then break end
+            end
+        end
+
+        if landing then
+            S.eventCount += 1
+            addThreat({
+                kind = "CIRCLE",
+                source = "event",
+                label = "VOLCANIC: Artillery Lava Walker LANDING",
+                position = landing,
+                radius = CFG.VOLCANIC_ARTILLERY_IMPACT_RADIUS,
+                endAt = clock() + CFG.VOLCANIC_ARTILLERY_EVENT_HOLD,
+                redodgeEligible = true,
+                artilleryLavaWalker = true,
+            })
+            S.lastAction = "Artillery Lava Walker -> evade locked landing zone"
+        else
+            S.lastAction = "Artillery Lava Walker event -> landing CFrame missing"
+        end
+        return true
+    end
+
     -- Lava King / third boss bomb. The decompile passes the cursed Character as
     -- args[2], spawns six thirdBossCurseRing parts centered on that character for
     -- six seconds, and later emits Curse Sizzle (successful green-zone cancel) or
@@ -4297,6 +4348,32 @@ local function registerVisualPart(part)
         end
     end
 
+    -- Artillery Lava Walker live fallback. artilleryRock is tweened vertically, so
+    -- AssemblyLinearVelocity may be zero and generic projectile prediction adds no value.
+    -- Its XZ is already the exact landing XZ for its entire 0.5-second fall; treat it as
+    -- the impact circle immediately. This also recovers if the script attached after the
+    -- Artillery Mob Shot remote already fired.
+    if name:find("artilleryrock", 1, true) then
+        local hardEnd = clock() + CFG.VOLCANIC_ARTILLERY_MAX_LIFE
+        addThreat({
+            kind = "CIRCLE",
+            source = "visual",
+            label = "VOLCANIC: Artillery Lava Walker ROCK IMPACT",
+            part = part,
+            position = part.Position,
+            radius = CFG.VOLCANIC_ARTILLERY_IMPACT_RADIUS,
+            requiresPart = false,
+            livePartUntilRemoved = true,
+            postRemoveGrace = CFG.VOLCANIC_ARTILLERY_POST_REMOVE,
+            hardEndAt = hardEnd,
+            endAt = hardEnd,
+            redodgeEligible = true,
+            artilleryLavaWalker = true,
+        })
+        S.lastAction = "Artillery rock acquired -> landing XZ blocker"
+        return
+    end
+
     -- The Volcanic dump contains enemyProjectiles.explosiveMobShot1/2/3, but the
     -- client map event only shows the shooter's muzzle particle. Track every live
     -- part under those exact enemy-owned templates, using its real size and motion.
@@ -4478,7 +4555,8 @@ local function hookTransientVisuals()
         -- become threats, so player spell cylinders remain ignored.
         local cylinderCandidate = inst.ClassName == "Part" and inst.Shape == Enum.PartType.Cylinder
         local volcanicExplosiveCandidate = quickName:find("explosivemobshot", 1, true) ~= nil
-        if not renderedCircle and not cylinderCandidate and not volcanicExplosiveCandidate
+        local volcanicArtilleryCandidate = quickName:find("artilleryrock", 1, true) ~= nil
+        if not renderedCircle and not cylinderCandidate and not volcanicExplosiveCandidate and not volcanicArtilleryCandidate
             and not containsAny(quickName, VISUAL_DANGER_WORDS) then return end
 
         -- PrecastHitbox.Circle's anonymous renderer should be registered
@@ -4512,6 +4590,7 @@ local function hookTransientVisuals()
                 if isRenderedPrecastCircle(inst)
                     or (inst.ClassName == "Part" and inst.Shape == Enum.PartType.Cylinder)
                     or n:find("explosivemobshot", 1, true)
+                    or n:find("artilleryrock", 1, true)
                     or containsAny(n, VISUAL_DANGER_WORDS) then
                     registerVisualPart(inst)
                 end
